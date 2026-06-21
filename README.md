@@ -1,5 +1,7 @@
 # Siril Wizard – Automatic Multi-Session Processing Plus (AMSP Plus)
 
+## Note - This is still being developed and tested to find small feature improvements, bugs, or edge cases not considered
+
 AMSP Plus is a Siril Python script that automates calibration and stacking across multiple imaging sessions. This is based on the AMSP.py script developed for Siril, but with many features added on top to make stacking more accessible, and add more useful tools for more advanced usage.  Drop in your FITS files — sorted or not — and it groups them by object, session, filter, and exposure time, matches them against calibration masters, and runs the full pipeline through to a final stacked image per target.
 
 This document covers the core workflow: building calibration masters (both from a shared library and from files dropped in for a single run), matching those masters to your light frames, the pipeline options, and the two interactive review tools available during processing.
