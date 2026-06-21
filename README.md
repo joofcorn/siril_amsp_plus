@@ -8,6 +8,9 @@ This document covers the core workflow: building calibration masters (both from 
 
 Drag FITS files or folders onto the drop zone. AMSP reads each file's header (`IMAGETYP`, `FILTER`, `EXPTIME`, `DATE-OBS`, and related keywords) and builds a tree showing what it found: lights grouped by target and observing night, calibration sub-frames grouped by type, and any master frames already present. The "night" boundary is noon-to-noon, so a session that runs past midnight stays grouped together.
 
+Files prefixed with BAD_ (like ones from Nina) can optionally be removed when found.
+![remove bad files](screenshots/exclude_bad.jpg)
+
 Master-frame detection doesn't rely on the filename alone. A file is treated as a master if its name contains the word "master", or if its `STACKCNT` header is greater than 1, or if its `LIVETIME` exceeds its `EXPTIME` — so a folder mixing raw subs and finished masters sorts correctly without any manual tagging.
 
 Once your files are loaded and calibration is matched (see below), click **▶ Go – Start Pre-processing**. The pipeline runs four phases: registering calibration masters into place, calibrating each session's lights, registering and stacking all sessions of a filter together, and finally aligning multiple stacks of the same target if more than one exists.
@@ -17,6 +20,9 @@ Note that AMSP itself no longer stacks raw bias/dark/flat sub-frames as part of 
 ## Building calibration masters
 
 There are two distinct ways to get from raw calibration sub-frames to finished masters, and they serve different purposes.
+
+![master library stacking](screenshots/build_masters.jpg)
+![master library stacking](screenshots/build_masters_2.jpg)
 
 ### Master library stacking
 
@@ -43,6 +49,9 @@ These locally-stacked masters appear in the file tree under their own **🧪 Thi
 ## Matching masters to light frame groups
 
 However your masters were produced — library, local stacking, or simply dropped in directly as finished files — they still need to be paired with the right light frame groups before the lights can be calibrated. Click the **🌓** button (tooltip: "Assign master flats to sessions") to open the **Calibration Master Assignments** window.
+
+![adjusting master calibrations](screenshots/adjusting_calibrations.jpg)
+![seeing matched masters for lights](screenshots/matched_calibrations.jpg)
 
 This window has two tabs:
 
@@ -72,12 +81,18 @@ The **🔧** button opens the options dialog, which covers several independent s
 
 ## The sequence reviewer
 
+![sequence reviewer](screenshots/frame_review.jpg)
+
 When **Interactive frame review** is on, AMSP pauses twice per filter group during processing: once right after calibration, and once after registration.
 
 The first pause shows a **thumbnail viewer** — every calibrated frame, auto-stretched and rendered as a thumbnail, with a checklist you can use to deselect anything that looks bad before it goes into registration. Thumbnails load progressively in the background while you browse, with the frame nearest wherever you're currently looking prioritized first. Arrow keys step through frames and Space toggles the current one; there's also a "Toggle All" shortcut and a "Keep All & Continue" button if nothing needs removing.
 
 ## The quality graph tool
 
+![quality graph tool](screenshots/graph_metrics.jpg)
+
 The second pause, after registration, shows an interactive **quality graph** plotting one metric at a time — wFWHM, roundness, or median — across every frame in the sequence. Points are colored by current keep/drop state, and clicking a point toggles it directly. You can also drag a threshold line down from the top of the graph to drop every frame above a value, or drag one up from the bottom to drop everything below a value; each metric keeps its own independent pair of thresholds, and moving a line back toward its edge re-selects whatever it passes over.
 
 From this same window you can click **🧪 Preview Stack** to build a temporary stack from whatever's currently selected, without committing to it. The result opens in a separate, non-blocking **Stack Previews** window with a zoomable, pannable, full-resolution view (not just a thumbnail) of each preview you've generated, so you can compare different selection thresholds side by side before deciding. If one of those previews is the one you actually want, clicking **✔ Use this stack** there copies it into the final output and skips re-stacking — otherwise, confirming your selection back in the graph window proceeds straight to the normal final stack using whatever frames are currently selected.
+
+![stack preview](screenshots/preview_stack.jpg)
