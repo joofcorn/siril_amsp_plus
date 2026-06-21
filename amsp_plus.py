@@ -90,6 +90,23 @@ VERSION          = "1.0.0"
 FITS_SUFFIXES    = {'.fits', '.fit', '.fts'}
 FITS_FZ_SUFFIXES = {'.fits.fz', '.fit.fz', '.fts.fz'}
 FITS_EXTS      = tuple(FITS_SUFFIXES | FITS_FZ_SUFFIXES)
+
+# DSLR / mirrorless camera RAW file extensions Siril's CONVERT / CONVERTRAW
+# commands can ingest (via libraw).  Matched case-insensitively.
+RAW_SUFFIXES = {
+    '.nef',          # Nikon
+    '.cr2', '.cr3',  # Canon
+    '.arw', '.srf', '.sr2',  # Sony
+    '.orf',          # Olympus / OM System
+    '.rw2',          # Panasonic
+    '.raf',          # Fujifilm
+    '.pef',          # Pentax
+    '.dng',          # Adobe / generic
+    '.raw',          # Panasonic/Leica generic
+    '.3fr',          # Hasselblad
+    '.x3f',          # Sigma
+}
+RAW_EXTS = tuple(RAW_SUFFIXES)
 def _default_config_path() -> Path:
     """Return the platform-appropriate config path for the script."""
     if sys.platform == 'win32':
@@ -159,6 +176,31 @@ def is_fits_file(p: Path) -> bool:
     return any(name.endswith(ext) for ext in FITS_EXTS)
 
 
+def is_raw_file(p: Path) -> bool:
+    name = p.name.lower()
+    return any(name.endswith(ext) for ext in RAW_EXTS)
+
+
+def collect_raw(paths: list[str]) -> list[Path]:
+    """Recursively collect deduplicated RAW files from file/folder paths."""
+    found: list[Path] = []
+    for p in paths:
+        pp = Path(p)
+        if pp.is_dir():
+            for f in pp.rglob('*'):
+                if f.is_file() and is_raw_file(f):
+                    found.append(f)
+        elif pp.is_file() and is_raw_file(pp):
+            found.append(pp)
+    seen, unique = set(), []
+    for f in found:
+        key = f.resolve()
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    return unique
+
+
 def _qflag(flag: str, path) -> str:
     """Build a Siril flag argument, quoting the ENTIRE token on Windows or when
     the path contains spaces.
@@ -216,6 +258,262 @@ def night_key(date_obs: str) -> str:
         return '????-??-??'
 
 
+# =============================================================================
+# DSLR RAW import — folder / filename parsing
+# =============================================================================
+#
+# RAW files (Nikon NEF, Canon CR2/CR3, Sony ARW, etc.) carry no FITS-style
+# IMAGETYP/EXPTIME/FILTER/DATE-OBS headers, and EXIF shutter-speed is not
+# reliable for long-exposure astro subs taken in bulb mode.  Per design,
+# grouping is therefore derived purely from folder and filename conventions:
+#
+#   Lights (tied to a target):
+#       <TARGET>/LIGHT/<FILTER>/<EXPTIME>/*.raw      (filter optional)
+#       <TARGET>/LIGHT/<EXPTIME>/*.raw                (no filter)
+#
+#   Calibration (no target):
+#       DARK/<EXPTIME>/*.raw
+#       FLAT/<FILTER>/*.raw          (flats are grouped by filter, not exptime —
+#                                      flat exposure time varies panel to panel)
+#       FLAT/*.raw                   (no filter / mono)
+#       BIAS/*.raw
+#
+# Filenames may also carry the same tokens directly, e.g.
+#   IMG_30s_0001.NEF   DSC_Ha_90s_0003.CR2   light_M31_300s_001.nef
+#
+# Type folders are matched case-insensitively against LIGHT/DARK/FLAT/BIAS
+# (and common synonyms).  Any folder segment that is not recognised as a
+# type, an exposure-time token, or a known date pattern is treated as either
+# the target name (for paths under a recognised LIGHT branch) or a filter
+# name (for paths under a recognised LIGHT/FLAT branch) — never both, and
+# never guessed when ambiguous; ambiguous files are left unresolved for the
+# user to assign manually in the RawImportWizard.
+
+_RAW_TYPE_SYNONYMS = {
+    'light':  'light',  'lights':  'light',  'lgt': 'light',
+    'dark':   'dark',   'darks':   'dark',
+    'flat':   'flat',   'flats':   'flat',
+    'bias':   'bias',   'biases':  'bias',   'offset': 'bias', 'offsets': 'bias',
+}
+
+# Matches exposure-time tokens like "30s", "1.5s", "300S", "0.5SEC", "90sec"
+_RAW_EXPTIME_RE = re.compile(
+    r'^(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)$', re.IGNORECASE)
+
+# Matches date tokens in folder/file names: 2026-01-15, 2026_01_15, 20260115,
+# 15-01-2026, 01-15-2026 (the last two are ambiguous, resolved best-effort).
+_RAW_DATE_PATTERNS = [
+    re.compile(r'(?P<y>\d{4})[-_.](?P<m>\d{2})[-_.](?P<d>\d{2})'),
+    re.compile(r'(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})(?!\d)'),
+]
+
+
+def _raw_parse_exptime_token(token: str) -> 'Optional[float]':
+    """Return exposure time in seconds if *token* matches an exptime pattern."""
+    m = _RAW_EXPTIME_RE.match(token.strip())
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _raw_normalize_type(token: str) -> 'Optional[str]':
+    """Return canonical type ('light'/'dark'/'flat'/'bias') for a folder/filename token."""
+    return _RAW_TYPE_SYNONYMS.get(token.strip().lower())
+
+
+def _raw_find_date_in_text(text: str) -> 'Optional[str]':
+    """Search *text* for a date pattern and return it as YYYY-MM-DD, or None."""
+    for pat in _RAW_DATE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try:
+                y, mo, d = int(m.group('y')), int(m.group('m')), int(m.group('d'))
+                if 1990 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+                    return f'{y:04d}-{mo:02d}-{d:02d}'
+            except Exception:
+                continue
+    return None
+
+
+def _raw_tokenize_filename(stem: str) -> list:
+    """Split a filename stem into tokens on common separators."""
+    return [t for t in re.split(r'[_\-. ]+', stem) if t]
+
+
+def parse_raw_path(path: Path, raw_root: Path) -> dict:
+    """
+    Derive type/target/filter/exptime/date for a single RAW file from its
+    path (relative to *raw_root*, the folder or collection of folders the
+    user dropped) and its filename.
+
+    Returns a dict:
+      {
+        'path':        Path,
+        'name':        str,
+        'imgtype':     'light' | 'dark' | 'flat' | 'bias' | None,
+        'target':      str | None,   # only meaningful for 'light'
+        'filter':      str | None,
+        'exptime':     float | None,
+        'date_str':    str | None,   # YYYY-MM-DD if found in path/filename
+        'resolved':    bool,         # True if imgtype AND exptime (or for
+                                      # flats, imgtype) are confidently known
+        'reasons':     list[str],    # human-readable reasons it's unresolved
+      }
+
+    Resolution rules:
+      - imgtype is required for every file (from a type folder or filename
+        token).  Without it the file is always unresolved.
+      - light / dark require an exptime (folder or filename token).
+      - flat requires a filter OR is accepted with no filter (mono / single
+        flat setup) — exptime is not required for flats.
+      - bias requires neither exptime nor filter.
+    """
+    info = {
+        'path': path, 'name': path.name,
+        'imgtype': None, 'target': None, 'filter': None,
+        'exptime': None, 'date_str': None,
+        'resolved': False, 'reasons': [],
+    }
+
+    try:
+        rel_parts = list(path.relative_to(raw_root).parts[:-1])  # folders only
+    except ValueError:
+        # path isn't under raw_root (shouldn't normally happen) — fall back
+        # to the last few parent folder names so parsing can still proceed.
+        rel_parts = [pp.name for pp in list(path.parents)[2::-1]]
+
+    # ── Pass 1: classify each folder segment ──────────────────────────────
+    type_idx: 'Optional[int]' = None
+    imgtype: 'Optional[str]'  = None
+    exptime: 'Optional[float]' = None
+    exptime_idx: 'Optional[int]' = None
+    leftover_idx: list = []
+
+    for i, seg in enumerate(rel_parts):
+        t = _raw_normalize_type(seg)
+        if t is not None and imgtype is None:
+            imgtype, type_idx = t, i
+            continue
+        et = _raw_parse_exptime_token(seg)
+        if et is not None and exptime is None:
+            exptime, exptime_idx = et, i
+            continue
+        leftover_idx.append(i)
+
+    # ── Pass 2: filename tokens (fallback / supplement) ────────────────────
+    fname_tokens = _raw_tokenize_filename(path.stem)
+    fname_type: 'Optional[str]' = None
+    fname_exptime: 'Optional[float]' = None
+    for tok in fname_tokens:
+        if fname_type is None:
+            t = _raw_normalize_type(tok)
+            if t is not None:
+                fname_type = t
+        if fname_exptime is None:
+            et = _raw_parse_exptime_token(tok)
+            if et is not None:
+                fname_exptime = et
+
+    if imgtype is None:
+        imgtype = fname_type
+    if exptime is None:
+        exptime = fname_exptime
+
+    info['imgtype'] = imgtype
+
+    # ── Date: folder segments first, then filename, then mtime, then ctime ─
+    date_str = None
+    for seg in rel_parts:
+        date_str = _raw_find_date_in_text(seg)
+        if date_str:
+            break
+    if not date_str:
+        date_str = _raw_find_date_in_text(path.stem)
+    if not date_str:
+        try:
+            date_str = datetime.fromtimestamp(
+                path.stat().st_mtime).strftime('%Y-%m-%d')
+        except Exception:
+            try:
+                date_str = datetime.fromtimestamp(
+                    path.stat().st_ctime).strftime('%Y-%m-%d')
+            except Exception:
+                date_str = None
+    info['date_str'] = date_str
+
+    # ── Remaining (non-type, non-exptime, non-date) folder segments ────────
+    # are candidates for target name (lights) or filter (lights/flats).
+    remaining = []
+    for i in leftover_idx:
+        seg = rel_parts[i]
+        if _raw_find_date_in_text(seg) is not None:
+            continue   # pure date token — already captured above, skip
+        remaining.append((i, seg))
+
+    if imgtype == 'light':
+        info['exptime'] = exptime
+        # Folder order is TARGET / LIGHT / [FILTER] / [EXPTIME].
+        # Segments before the type folder are target candidates;
+        # segments after it (excluding the exptime folder) are filter candidates.
+        before = [seg for i, seg in remaining if type_idx is not None and i < type_idx]
+        after  = [seg for i, seg in remaining if type_idx is not None and i > type_idx]
+        if type_idx is None:
+            # No explicit LIGHT folder found in the path at all — everything
+            # leftover is ambiguous; leave target/filter unset.
+            pass
+        else:
+            if before:
+                info['target'] = before[-1]   # closest-to-root segment before TYPE
+            if after:
+                info['filter'] = after[0]     # first segment after TYPE that isn't exptime
+
+        missing = []
+        if info['target'] is None:
+            missing.append('target name (no folder above LIGHT/)')
+        if info['exptime'] is None:
+            missing.append('exposure time (no "<N>s" folder or filename token)')
+        info['reasons'] = missing
+        info['resolved'] = not missing
+
+    elif imgtype == 'dark':
+        info['exptime'] = exptime
+        if info['exptime'] is None:
+            info['reasons'] = ['exposure time (no "<N>s" folder or filename token)']
+        info['resolved'] = info['exptime'] is not None
+
+    elif imgtype == 'flat':
+        # Flats group by filter, not exptime; exptime is optional metadata.
+        info['exptime'] = exptime
+        after = [seg for i, seg in remaining if type_idx is not None and i > type_idx]
+        if after:
+            info['filter'] = after[0]
+        info['resolved'] = True   # filter is optional for flats (mono setups)
+
+    elif imgtype == 'bias':
+        info['resolved'] = True
+
+    else:
+        info['reasons'] = ['could not determine frame type (no LIGHT/DARK/FLAT/BIAS '
+                           'folder or filename token found)']
+        info['resolved'] = False
+
+    return info
+
+
+RAW_FOLDER_EXAMPLE = (
+    'M31/LIGHT/Ha/30s/IMG_0001.NEF\n'
+    'M31/LIGHT/Ha/30s/IMG_0002.NEF\n'
+    'M31/LIGHT/OIII/30s/IMG_0010.NEF\n'
+    'DARK/30s/IMG_0100.NEF\n'
+    'FLAT/Ha/IMG_0200.NEF\n'
+    'FLAT/OIII/IMG_0210.NEF\n'
+    'BIAS/IMG_0300.NEF'
+)
+
+
 def collect_fits(paths: list[str]) -> list[Path]:
     """Recursively collect deduplicated FITS files from file/folder paths."""
     found: list[Path] = []
@@ -246,6 +544,11 @@ def _find_image_header(hdul):
         if 'IMAGETYP' in hdu.header:
             return hdu.header
     return hdul[0].header
+
+
+def _camera_id_from_header(h) -> str:
+    """Return the camera identity string for a FITS header (INSTRUME only)."""
+    return str(h.get('INSTRUME', '')).strip()
 
 
 def _is_master_filename(path: Path) -> bool:
@@ -288,7 +591,6 @@ def read_fits_info(path: Path) -> dict:
         'object_name':  '',
         'bayerpat':     None,    # str if CFA, None if mono
         'instrume':     '',
-        'cameraid':     '',      # CAMERAID preferred, INSTRUME fallback
         'set_temp':     None,    # float if SET-TEMP present, else None
         'width':        0,
         'height':       0,
@@ -325,12 +627,10 @@ def read_fits_info(path: Path) -> dict:
             bp = str(h.get('BAYERPAT', '')).strip()
             if bp:
                 info['bayerpat'] = bp
-            # Camera identity: CAMERAID (unique HW id) preferred, INSTRUME fallback
+            # Camera identity: INSTRUME only.
             instrume = str(h.get('INSTRUME', '')).strip()
             if instrume:
                 info['instrume'] = instrume
-            cameraid = str(h.get('CAMERAID', '')).strip()
-            info['cameraid'] = cameraid if cameraid else instrume
             # Telescope identity + focal length (used for flat grouping)
             telescop = str(h.get('TELESCOP', '')).strip()
             if telescop:
@@ -932,7 +1232,7 @@ class PreprocessingEngine:
 
         Priority 0: user-confirmed assignment from CalibrationMatcherDialog.
         Priority 1: 'session' mode – match by session date only.
-        Priority 2: 'library' mode – match on CAMERAID/INSTRUME, EXPTIME, SET-TEMP.
+        Priority 2: 'library' mode – match on INSTRUME, EXPTIME, SET-TEMP.
         """
         # ── 0. User-confirmed override ────────────────────────────────────────
         dkey = (session, filt_safe, exp_k, temp_k)
@@ -994,9 +1294,9 @@ class PreprocessingEngine:
 
         def _score(candidate_et, candidate_temp, candidate_camera: str = ''):
             """Lower is better. Returns None if candidate is incompatible."""
-            # Camera identity check (CAMERAID preferred, INSTRUME fallback)
-            if self.camera_id and candidate_camera:
-                if candidate_camera != self.camera_id:
+            # Camera identity check (INSTRUME)
+            if self.instrument and candidate_camera:
+                if candidate_camera != self.instrument:
                     return None   # wrong camera
             # Exptime check
             if exptime is not None and candidate_et is not None:
@@ -5160,7 +5460,7 @@ class CalibrationMatcherDialog(QDialog):
 
     Darks tab  – (session, filter, exptime, set_temp) groups → master dark
       Searches the external dark library (if set) and pre-selects the best
-      match by CAMERAID/INSTRUME + EXPTIME(±20%) + SET-TEMP(±1°C).
+      match by INSTRUME + EXPTIME(±20%) + SET-TEMP(±1°C).
       Always shown, even if no external dark folder is set (shows 'none').
 
     Results:
@@ -5375,7 +5675,7 @@ class CalibrationMatcherDialog(QDialog):
             'By camera / exposure / temperature  (library)')
         self.radio_dark_library.setToolTip(
             'Match lights to a dark by:\n'
-            '  • CAMERAID or INSTRUME  (exact)\n'
+            '  • INSTRUME              (exact)\n'
             '  • EXPTIME               (within 20 %)\n'
             '  • SET-TEMP              (within 1 °C)')
         self._dark_btn_grp = QButtonGroup()
@@ -5606,7 +5906,7 @@ class CalibrationMatcherDialog(QDialog):
                             temp_val = float(raw); break
                     temp_s = (f'{temp_val:.1f}\u00b0C'
                               if temp_val is not None else '?\u00b0C')
-                    cid = str(h.get('CAMERAID', h.get('INSTRUME', ''))).strip()
+                    cid = str(h.get('INSTRUME', '')).strip()
                     dobs = str(h.get('DATE-OBS', '')).strip()
                     if dobs:
                         try:
@@ -5669,7 +5969,7 @@ class CalibrationMatcherDialog(QDialog):
                                     ignore_missing_simple=True) as hdul:
                     h = _find_image_header(hdul)
                     # Camera check
-                    dcam = str(h.get('CAMERAID', h.get('INSTRUME', ''))).strip()
+                    dcam = str(h.get('INSTRUME', '')).strip()
                     if cam_id and dcam and dcam != cam_id:
                         continue
                     # Exptime check
@@ -5826,7 +6126,7 @@ def _build_dark_stacking_plan(subs: list) -> list:
     """
     Group dark sub-frames into stacks.
 
-    Grouping key: (library_root, instrume/cameraid, exptime_bucket, temp_bucket, night)
+    Grouping key: (library_root, instrume, exptime_bucket, temp_bucket, night)
 
     Dark date tolerance: a stack may contain darks from nights within ±3 days
     of each other.  We find connected components: two nights are in the same
@@ -5866,10 +6166,10 @@ def _build_dark_stacking_plan(subs: list) -> list:
 
     # Build raw groups keyed by (library_root, camera, exp_s, temp_c)
     # Collect all raw camera strings first so _trim_camera can judge uniqueness
-    _all_cam_raws = [fi.get('cameraid') or fi.get('instrume', '') or '?' for fi in subs]
+    _all_cam_raws = [fi.get('instrume') or '?' for fi in subs]
     raw: dict = {}
     for fi in subs:
-        _raw_cam = fi.get('cameraid') or fi.get('instrume', '') or '?'
+        _raw_cam = fi.get('instrume') or '?'
         cam      = _trim_camera(_raw_cam, _all_cam_raws)
         exp_s    = _exp_bucket(fi.get('exptime'))
         temp_c   = _temp_bucket(fi.get('set_temp'))
@@ -5982,10 +6282,10 @@ def _build_flat_stacking_plan(subs: list) -> list:
 
     Returns a list of stack-plan dicts similar to _build_dark_stacking_plan.
     """
-    _all_cam_raws_f = [fi.get('cameraid') or fi.get('instrume', '') or '?' for fi in subs]
+    _all_cam_raws_f = [fi.get('instrume') or '?' for fi in subs]
     raw: dict = {}
     for fi in subs:
-        _raw_cam = fi.get('cameraid') or fi.get('instrume', '') or '?'
+        _raw_cam = fi.get('instrume') or '?'
         cam      = _trim_camera(_raw_cam, _all_cam_raws_f)
         flt      = fi.get('filter') or NO_FILTER
         flt_s   = _safe_name(flt)
@@ -6329,10 +6629,10 @@ def _build_local_dark_stacking_plan(subs: list, proc_root: Path) -> list:
     the wizard treats them as the bias step; everything else is imgtype='dark'.
     """
     from collections import defaultdict as _dd
-    all_cam_raws = [fi.get('cameraid') or fi.get('instrume', '') or '?' for fi in subs]
+    all_cam_raws = [fi.get('instrume') or '?' for fi in subs]
     raw: dict = _dd(list)
     for fi in subs:
-        cam_raw = fi.get('cameraid') or fi.get('instrume', '') or '?'
+        cam_raw = fi.get('instrume') or '?'
         cam     = _trim_camera(cam_raw, all_cam_raws)
         et      = fi.get('exptime')
         et_k    = round(float(et), 2) if et is not None else None
@@ -6373,10 +6673,10 @@ def _build_local_flat_stacking_plan(subs: list, proc_root: Path) -> list:
     No cross-night merging.
     """
     from collections import defaultdict as _dd
-    all_cam_raws = [fi.get('cameraid') or fi.get('instrume', '') or '?' for fi in subs]
+    all_cam_raws = [fi.get('instrume') or '?' for fi in subs]
     raw: dict = _dd(list)
     for fi in subs:
-        cam_raw = fi.get('cameraid') or fi.get('instrume', '') or '?'
+        cam_raw = fi.get('instrume') or '?'
         cam     = _trim_camera(cam_raw, all_cam_raws)
         flt     = fi.get('filter') or NO_FILTER
         flt_s   = _safe_name(flt)
@@ -6519,7 +6819,7 @@ class LibraryStackingWorker(QThread):
     def _cd(self, path: Path):
         path.mkdir(parents=True, exist_ok=True)
         p = str(path.resolve())
-        self.siril.cmd(f'cd {p}' if ' ' in p else f'cd {p}')
+        self.siril.cmd(f'cd "{p}"' if ' ' in p else f'cd {p}')
 
     def _copy_files(self, files: list, dest: Path):
         """Hard-copy fi dicts into dest, resolving name collisions."""
@@ -7151,7 +7451,7 @@ class MoveToLibraryDialog(QDialog):
 
             # Metadata columns
             if imgtype == 'dark':
-                cam_raws = [fi.get('cameraid') or fi.get('instrume', '') or '?'
+                cam_raws = [fi.get('instrume') or '?'
                             for fi in files]
                 cam = _trim_camera(cam_raws[0], cam_raws) if cam_raws else '?'
                 exptimes = [fi.get('exptime') for fi in files
@@ -7174,7 +7474,7 @@ class MoveToLibraryDialog(QDialog):
                 tbl.setItem(row, 5, _tbl_item(str(len(files)), center=True))
                 dest_col = 6
             else:
-                cam_raws = [fi.get('cameraid') or fi.get('instrume', '') or '?'
+                cam_raws = [fi.get('instrume') or '?'
                             for fi in files]
                 cam = _trim_camera(cam_raws[0], cam_raws) if cam_raws else '?'
                 filt = (files[0].get('filter') or NO_FILTER) if files else NO_FILTER
@@ -8422,8 +8722,7 @@ class LocalStackingWizard(LibraryStackingWizard):
                         _imgtype = normalize_imagetyp(str(_h.get('IMAGETYP', '')))
                         _et_raw  = _h.get('EXPTIME', _h.get('EXPOSURE', None))
                         _et      = float(_et_raw) if _et_raw is not None else None
-                        _cam     = str(_h.get('CAMERAID',
-                                              _h.get('INSTRUME', ''))).strip()
+                        _cam     = str(_h.get('INSTRUME', '')).strip()
                         _t_raw   = None
                         for _tk in ('SET-TEMP', 'CCD-TEMP'):
                             _tv = _h.get(_tk, None)
@@ -8755,6 +9054,1107 @@ class LocalStackingWizard(LibraryStackingWizard):
             return
         p = worker_plans[plan_index]
         self.output_paths[id(p)] = Path(path_str)
+
+
+# =============================================================================
+# DSLR RAW import — group model + confirmation wizard
+# =============================================================================
+
+class RawGroup:
+    """
+    One confirmed group of RAW sub-frames that will become a single Siril
+    CONVERT sequence, all sharing the same synthesized FITS header values.
+
+    key fields mirror what read_fits_info() would have produced from real
+    FITS headers, so downstream code (header synthesis, dark/flat matching,
+    the DSLR stacking wizard) can treat a RawGroup almost like a pre-scanned
+    fi-dict group.
+    """
+    __slots__ = ('imgtype', 'target', 'filter', 'exptime', 'date_str', 'files')
+
+    def __init__(self, imgtype: str, target: 'Optional[str]' = None,
+                 filt: 'Optional[str]' = None, exptime: 'Optional[float]' = None,
+                 date_str: 'Optional[str]' = None):
+        self.imgtype  = imgtype
+        self.target   = target
+        self.filter   = filt
+        self.exptime  = exptime
+        self.date_str = date_str
+        self.files: list[Path] = []
+
+    def key(self) -> tuple:
+        return (self.imgtype, self.target, self.filter, self.exptime, self.date_str)
+
+    def label(self) -> str:
+        parts = [self.imgtype.upper()]
+        if self.target:
+            parts.append(self.target)
+        if self.filter:
+            parts.append(self.filter)
+        if self.exptime is not None:
+            et = self.exptime
+            parts.append(f'{int(et)}s' if et == int(et) else f'{et}s')
+        if self.date_str:
+            parts.append(self.date_str)
+        return '  ·  '.join(parts)
+
+    def folder_name(self) -> str:
+        """Sanitised folder name used for the converted-FITS output dir."""
+        bits = [self.imgtype]
+        if self.target:
+            bits.append(_safe_name(self.target))
+        if self.filter:
+            bits.append(_safe_name(self.filter))
+        if self.exptime is not None:
+            et = self.exptime
+            bits.append(f'{int(et)}s' if et == int(et) else f'{et}s'.replace('.', 'p'))
+        if self.date_str:
+            bits.append(self.date_str)
+        return '_'.join(bits)
+
+
+_RAW_GROUP_REQUIREMENTS = {
+    'light': ('target', 'exptime'),   # filter optional
+    'dark':  ('exptime',),
+    'flat':  (),                      # filter optional, exptime optional
+    'bias':  (),
+}
+
+
+def _raw_group_is_complete(imgtype: str, target, filt, exptime) -> bool:
+    """Return True if the given field combination is sufficient for imgtype."""
+    req = _RAW_GROUP_REQUIREMENTS.get(imgtype)
+    if req is None:
+        return False
+    if 'target' in req and not target:
+        return False
+    if 'exptime' in req and exptime is None:
+        return False
+    return True
+
+
+class _RawFileItem(QTreeWidgetItem):
+    """Leaf tree item representing a single RAW file, draggable between groups."""
+    def __init__(self, path: Path):
+        super().__init__()
+        self.raw_path = path
+        self.setText(0, path.name)
+        self.setFlags(
+            Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsDragEnabled)
+        self.setToolTip(0, str(path))
+
+
+class _RawGroupTree(QTreeWidget):
+    """
+    Tree of group nodes (top level) containing RAW file leaves.  Supports
+    dragging file leaves between group nodes; dropping onto empty space or
+    a non-group target is rejected.  Emits files_moved after a successful
+    internal drag-drop so the wizard can refresh validation state.
+    """
+    files_moved = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(2)
+        self.setHeaderLabels(['Group / File', 'Count'])
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setAlternatingRowColors(True)
+        hdr = self.header()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+
+    def dropEvent(self, event: QDropEvent):
+        target = self.itemAt(event.position().toPoint())
+        # Resolve the target GROUP node: either the item itself (if it's a
+        # top-level group) or its parent (if dropped onto a file leaf).
+        if target is None:
+            event.ignore()
+            return
+        group_item = target if target.parent() is None else target.parent()
+        if group_item is None or group_item.parent() is not None:
+            event.ignore()
+            return
+
+        dragged = [it for it in self.selectedItems() if isinstance(it, _RawFileItem)]
+        if not dragged:
+            event.ignore()
+            return
+
+        for it in dragged:
+            old_parent = it.parent()
+            if old_parent is group_item:
+                continue
+            if old_parent is not None:
+                old_parent.removeChild(it)
+            else:
+                idx = self.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    self.takeTopLevelItem(idx)
+            group_item.addChild(it)
+
+        event.accept()
+        self.files_moved.emit()
+
+
+class RawImportWizard(QDialog):
+    """
+    Confirmation wizard shown after RAW files are detected.
+
+    Shows the parsed grouping (type / target / filter / exptime / date) as a
+    tree the user can review, drag files between groups to fix mistakes, or
+    create brand-new groups for files the automatic parser could not place.
+    "Continue" is disabled until every loaded RAW file belongs to a complete
+    group (i.e. has every field its imgtype requires).
+
+    After exec() == Accepted:
+      .groups   list[RawGroup]   – every non-empty confirmed group.
+    """
+
+    _STYLE = """
+        QDialog      { background: #0e0e1a; }
+        QLabel       { color: #cccccc; }
+        QTreeWidget  { background: #111126; color: #cccccc;
+                       border: 1px solid #2a2a44; }
+        QTreeWidget::item { padding: 2px 4px; }
+        QPushButton  { background: #1e2240; color: #cccccc;
+                       border: 1px solid #3a3a66; border-radius: 5px;
+                       padding: 4px 14px; }
+        QPushButton:hover { background: #252850; }
+        QPushButton:disabled { color: #44445a; border-color: #222240; }
+        QPushButton#continue_btn { background: #1e6b2e; color: #fff;
+                                   border: 1px solid #2ecc71; font-weight: bold; }
+        QPushButton#continue_btn:hover    { background: #27923e; }
+        QPushButton#continue_btn:disabled { background: #14201a; color: #335544;
+                                            border-color: #1a2a20; }
+        QComboBox    { background: #1e2240; color: #dddddd;
+                       border: 1px solid #3a3a66; border-radius: 4px;
+                       padding: 2px 6px; }
+        QLineEdit    { background: #1a1a2e; color: #dddddd;
+                       border: 1px solid #3a3a66; border-radius: 4px;
+                       padding: 3px 6px; }
+        QDoubleSpinBox { background: #1a1a2e; color: #dddddd;
+                       border: 1px solid #3a3a66; border-radius: 4px; }
+    """
+
+    def __init__(self, parent, raw_files: list[Path], raw_roots: list[Path]):
+        super().__init__(parent)
+        self.setWindowTitle('Import RAW Files – Confirm Grouping')
+        self.setMinimumSize(880, 620)
+        self.setStyleSheet(self._STYLE)
+
+        self._raw_files = raw_files
+        self._raw_roots = raw_roots
+        self.groups: list[RawGroup] = []
+
+        # group_key -> RawGroup, and group_key -> QTreeWidgetItem
+        self._group_map: dict = {}
+        self._group_items: dict = {}
+        self._unresolved_key = ('unresolved', None, None, None, None)
+
+        self._build_ui()
+        self._parse_and_populate()
+
+    # ── UI ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 12)
+
+        hdr = QLabel('📷  RAW files detected')
+        hdr.setStyleSheet('color:#ccddff; font-size:12pt; font-weight:bold;')
+        lay.addWidget(hdr)
+
+        desc = QLabel(
+            'RAW camera files carry no FITS headers, so grouping is derived from '
+            'folder and file naming.  Review the groups below — drag a file onto '
+            'a different group to correct it, or use "New Group…" for files the '
+            'parser could not place.  Continue is disabled until every file '
+            'belongs to a complete group.')
+        desc.setWordWrap(True)
+        desc.setStyleSheet('color:#8888bb; font-size:9pt;')
+        lay.addWidget(desc)
+
+        example_box = QFrame()
+        example_box.setStyleSheet(
+            'QFrame { background:#141428; border:1px solid #2a2a44; border-radius:6px; }')
+        ex_lay = QVBoxLayout(example_box)
+        ex_lay.setContentsMargins(10, 8, 10, 8)
+        ex_title = QLabel('Recommended folder structure:')
+        ex_title.setStyleSheet('color:#88ccff; font-size:9pt; font-weight:bold; border:none;')
+        ex_lay.addWidget(ex_title)
+        ex_text = QLabel(RAW_FOLDER_EXAMPLE.replace('\n', '<br>'))
+        ex_text.setTextFormat(Qt.TextFormat.RichText)
+        ex_text.setStyleSheet(
+            'color:#aaaacc; font-size:8pt; font-family:monospace; border:none;')
+        ex_lay.addWidget(ex_text)
+        lay.addWidget(example_box)
+
+        self._tree = _RawGroupTree()
+        self._tree.files_moved.connect(self._on_tree_changed)
+        lay.addWidget(self._tree, stretch=1)
+
+        self._status_lbl = QLabel('')
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet('color:#ffb347; font-size:9pt;')
+        lay.addWidget(self._status_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_new = QPushButton('➕  New Group…')
+        btn_new.setFixedHeight(30)
+        btn_new.clicked.connect(self._on_new_group)
+        btn_row.addWidget(btn_new)
+        btn_delete_empty = QPushButton('🗑  Remove Empty Groups')
+        btn_delete_empty.setFixedHeight(30)
+        btn_delete_empty.clicked.connect(self._remove_empty_groups)
+        btn_row.addWidget(btn_delete_empty)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(8)
+        bottom.addStretch()
+        btn_cancel = QPushButton('Cancel – skip RAW import')
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.clicked.connect(self.reject)
+        bottom.addWidget(btn_cancel)
+        self._btn_continue = QPushButton('✔  Continue')
+        self._btn_continue.setObjectName('continue_btn')
+        self._btn_continue.setFixedHeight(34)
+        self._btn_continue.setMinimumWidth(140)
+        self._btn_continue.clicked.connect(self._on_continue)
+        bottom.addWidget(self._btn_continue)
+        lay.addLayout(bottom)
+
+    # ── Parsing / population ─────────────────────────────────────────────
+
+    def _best_raw_root(self, path: Path) -> Path:
+        """Pick the raw_root that is an ancestor of *path* (closest match)."""
+        candidates = [r for r in self._raw_roots
+                      if r in path.parents or r == path.parent]
+        if candidates:
+            return max(candidates, key=lambda r: len(r.parts))
+        return path.parent
+
+    def _parse_and_populate(self):
+        for f in self._raw_files:
+            root = self._best_raw_root(f)
+            info = parse_raw_path(f, root)
+            self._place_file(f, info)
+        self._refresh_status()
+
+    def _ensure_group_item(self, group: RawGroup) -> QTreeWidgetItem:
+        key = group.key()
+        if key in self._group_items:
+            return self._group_items[key]
+        item = QTreeWidgetItem(self._tree)
+        item.setText(0, group.label())
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        complete = _raw_group_is_complete(
+            group.imgtype, group.target, group.filter, group.exptime)
+        label_emoji, color = TYPE_INFO.get(group.imgtype, ('❓', '#FF7070'))
+        item.setForeground(0, QColor(color if complete else '#FF7070'))
+        self._group_map[key]   = group
+        self._group_items[key] = item
+        self._tree.expandItem(item)
+        return item
+
+    def _unresolved_group_item(self) -> QTreeWidgetItem:
+        key = self._unresolved_key
+        if key in self._group_items:
+            return self._group_items[key]
+        g = RawGroup('unresolved')
+        item = QTreeWidgetItem(self._tree)
+        item.setText(0, '❓  Unresolved – needs manual assignment')
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled)
+        item.setForeground(0, QColor('#FF7070'))
+        font_bold = QFont(); font_bold.setBold(True)
+        item.setFont(0, font_bold)
+        self._group_map[key]   = g
+        self._group_items[key] = item
+        self._tree.expandItem(item)
+        return item
+
+    def _place_file(self, f: Path, info: dict):
+        if not info['resolved'] or info['imgtype'] is None:
+            item = self._unresolved_group_item()
+            file_item = _RawFileItem(f)
+            tip_reason = '; '.join(info.get('reasons') or ['unrecognised'])
+            file_item.setToolTip(0, f'{f}\n\nReason: {tip_reason}')
+            item.addChild(file_item)
+            return
+
+        group = RawGroup(info['imgtype'], info['target'], info['filter'],
+                         info['exptime'], info['date_str'])
+        item = self._ensure_group_item(group)
+        file_item = _RawFileItem(f)
+        item.addChild(file_item)
+
+    def _on_tree_changed(self):
+        self._refresh_status()
+
+    def _refresh_status(self):
+        """Walk the tree, recompute per-group counts/colours, validate, and
+        enable/disable Continue accordingly."""
+        n_unresolved = 0
+        incomplete_groups: list = []
+
+        root = self._tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            g_item = root.child(i)
+            n_files = g_item.childCount()
+            g_item.setText(1, str(n_files))
+            key = None
+            for k, it in self._group_items.items():
+                if it is g_item:
+                    key = k
+                    break
+            if key is None:
+                continue
+            group = self._group_map[key]
+            if group.imgtype == 'unresolved':
+                n_unresolved += n_files
+                g_item.setForeground(0, QColor('#FF7070'))
+                continue
+            complete = _raw_group_is_complete(
+                group.imgtype, group.target, group.filter, group.exptime)
+            label_emoji, color = TYPE_INFO.get(group.imgtype, ('❓', '#FF7070'))
+            if n_files == 0:
+                g_item.setForeground(0, QColor('#555566'))
+            elif complete:
+                g_item.setForeground(0, QColor(color))
+            else:
+                g_item.setForeground(0, QColor('#FF7070'))
+                incomplete_groups.append(group.label())
+
+        msgs = []
+        if n_unresolved:
+            msgs.append(
+                f'{n_unresolved} file(s) still in "Unresolved" — drag them into '
+                f'a group or create a new one.')
+        if incomplete_groups:
+            msgs.append(
+                f'{len(incomplete_groups)} group(s) are missing required info: '
+                + ', '.join(incomplete_groups[:5])
+                + ('…' if len(incomplete_groups) > 5 else ''))
+
+        if msgs:
+            self._status_lbl.setText('  '.join(msgs))
+            self._btn_continue.setEnabled(False)
+        else:
+            self._status_lbl.setText('✓  All files are assigned to complete groups.')
+            self._status_lbl.setStyleSheet('color:#55cc88; font-size:9pt;')
+            self._btn_continue.setEnabled(True)
+            return
+        self._status_lbl.setStyleSheet('color:#ffb347; font-size:9pt;')
+
+    def _remove_empty_groups(self):
+        root = self._tree.invisibleRootItem()
+        for i in reversed(range(root.childCount())):
+            g_item = root.child(i)
+            if g_item.childCount() == 0:
+                key = None
+                for k, it in list(self._group_items.items()):
+                    if it is g_item:
+                        key = k
+                        break
+                root.removeChild(g_item)
+                if key is not None:
+                    self._group_items.pop(key, None)
+                    self._group_map.pop(key, None)
+        self._refresh_status()
+
+    # ── New-group dialog ─────────────────────────────────────────────────
+
+    def _on_new_group(self):
+        dlg = _NewRawGroupDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        group = dlg.build_group()
+        if group is None:
+            return
+        self._ensure_group_item(group)
+        self._refresh_status()
+
+    # ── Accept ────────────────────────────────────────────────────────────
+
+    def _on_continue(self):
+        self.groups = []
+        root = self._tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            g_item = root.child(i)
+            key = None
+            for k, it in self._group_items.items():
+                if it is g_item:
+                    key = k
+                    break
+            if key is None or key == self._unresolved_key:
+                continue
+            group = self._group_map[key]
+            group.files = [g_item.child(j).raw_path for j in range(g_item.childCount())]
+            if group.files:
+                self.groups.append(group)
+        self.accept()
+
+
+class _NewRawGroupDialog(QDialog):
+    """Small modal for manually defining a new RawGroup (type/target/filter/exptime)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle('New Group')
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 12)
+
+        lay.addWidget(QLabel('Frame type:'))
+        self.combo_type = QComboBox()
+        self.combo_type.addItems(['light', 'dark', 'flat', 'bias'])
+        self.combo_type.currentTextChanged.connect(self._on_type_changed)
+        lay.addWidget(self.combo_type)
+
+        self.lbl_target = QLabel('Target name:')
+        lay.addWidget(self.lbl_target)
+        self.edit_target = QLineEdit()
+        self.edit_target.setPlaceholderText('e.g. M31')
+        lay.addWidget(self.edit_target)
+
+        self.lbl_filter = QLabel('Filter (optional):')
+        lay.addWidget(self.lbl_filter)
+        self.edit_filter = QLineEdit()
+        self.edit_filter.setPlaceholderText('e.g. Ha  (leave blank for none)')
+        lay.addWidget(self.edit_filter)
+
+        self.lbl_exptime = QLabel('Exposure time (seconds):')
+        lay.addWidget(self.lbl_exptime)
+        self.spin_exptime = QDoubleSpinBox()
+        self.spin_exptime.setRange(0.0, 7200.0)
+        self.spin_exptime.setDecimals(1)
+        self.spin_exptime.setValue(30.0)
+        lay.addWidget(self.spin_exptime)
+
+        self.lbl_date = QLabel('Date (optional, YYYY-MM-DD):')
+        lay.addWidget(self.lbl_date)
+        self.edit_date = QLineEdit()
+        self.edit_date.setPlaceholderText('leave blank to use file dates')
+        lay.addWidget(self.edit_date)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self._result_group: 'Optional[RawGroup]' = None
+        self._on_type_changed(self.combo_type.currentText())
+
+    def _on_type_changed(self, t: str):
+        is_light = (t == 'light')
+        is_flat  = (t == 'flat')
+        self.lbl_target.setVisible(is_light)
+        self.edit_target.setVisible(is_light)
+        self.lbl_filter.setVisible(is_light or is_flat)
+        self.edit_filter.setVisible(is_light or is_flat)
+        needs_exp = (t in ('light', 'dark'))
+        self.lbl_exptime.setVisible(needs_exp)
+        self.spin_exptime.setVisible(needs_exp)
+
+    def _on_accept(self):
+        t = self.combo_type.currentText()
+        target = self.edit_target.text().strip() or None
+        filt   = self.edit_filter.text().strip() or None
+        exptime = self.spin_exptime.value() if t in ('light', 'dark') else None
+        date_s = self.edit_date.text().strip() or None
+        if date_s and not _raw_find_date_in_text(date_s):
+            date_s = None
+        if t == 'light' and not target:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, 'Missing target',
+                                'Light frames need a target name.')
+            return
+        self._result_group = RawGroup(t, target, filt, exptime, date_s)
+        self.accept()
+
+    def build_group(self) -> 'Optional[RawGroup]':
+        return self._result_group
+
+
+# =============================================================================
+# DSLR RAW conversion engine
+# =============================================================================
+
+class RawConversionWorker(QThread):
+    """
+    Converts confirmed RawGroups into FITS using Siril's CONVERT command,
+    then synthesizes FITS headers (IMAGETYP / EXPTIME / FILTER / OBJECT /
+    DATE-OBS / BAYERPAT) into the resulting files via astropy so the rest of
+    the pipeline (read_fits_info, dark/flat matching, the engine) treats
+    them exactly like camera-native FITS subs.
+
+    RAW files are NEVER debayered at convert time — per Siril's own
+    guidance, demosaicing before calibration corrupts the pixel statistics
+    pre-processing relies on.  Debayering happens later, at calibrate time,
+    driven by the synthesized BAYERPAT header — identical to how this
+    pipeline already treats OSC astro-camera CFA frames.
+
+    Each group is converted into its own temp sub-directory (so Siril's
+    sequence numbering / basename never collides across groups), then the
+    resulting FITS files are copied into proc_dir/raw_converted/<group_folder>/
+    for the caller to pick up.
+
+    Signals:
+      progress(done, total, label)
+      finished(success, message)
+    """
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, siril: 's.SirilInterface', groups: list,
+                 out_root: Path, bayer_pattern: str = 'RGGB',
+                 temp_base_dir: 'Optional[Path]' = None):
+        super().__init__()
+        self.siril         = siril
+        self.groups         = groups   # list[RawGroup]
+        self.out_root       = out_root
+        self.bayer_pattern  = bayer_pattern
+        self._work_dir      = _make_temp_dir('siril_rawconv_', temp_base_dir)
+        # group.key() -> list[Path]  (converted+header-synthesized FITS files)
+        self.output_files: dict = {}
+
+    def _log(self, msg: str, color=LogColor.BLUE):
+        self.siril.log(msg, color)
+
+    def _cd(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        p = str(path.resolve())
+        self.siril.cmd(f'cd "{p}"' if ' ' in p else f'cd {p}')
+
+    def run(self):
+        total   = len(self.groups)
+        success = True
+        msg     = ''
+
+        original_wd: 'Optional[Path]' = None
+        try:
+            original_wd = Path(self.siril.get_siril_wd())
+        except Exception:
+            original_wd = None
+
+        try:
+            self.siril.cmd('set32bits')
+            self.siril.cmd('setcompress', '0')
+            self.siril.cmd('setext', 'fit')
+
+            self.out_root.mkdir(parents=True, exist_ok=True)
+
+            for i, group in enumerate(self.groups):
+                label = group.label()
+                self.progress.emit(i, total, label)
+                try:
+                    out_files = self._convert_group(i, group)
+                    self.output_files[group.key()] = out_files
+                except Exception as exc:
+                    self._log(f'  ⚠ Failed to convert {label}: {exc}',
+                              LogColor.SALMON)
+
+            self.progress.emit(total, total, 'Done')
+            self._log('RAW conversion complete.', LogColor.GREEN)
+        except Exception as exc:
+            success = False
+            msg = f'RAW conversion error: {exc}'
+            try:
+                self.siril.log(msg, LogColor.RED)
+            except Exception:
+                pass
+        finally:
+            if original_wd is not None and original_wd.exists():
+                try:
+                    _rp = str(original_wd.resolve())
+                    self.siril.cmd(f'cd "{_rp}"' if ' ' in _rp else f'cd {_rp}')
+                except Exception:
+                    pass
+            try:
+                shutil.rmtree(str(self._work_dir), ignore_errors=True)
+            except Exception:
+                pass
+        self.finished.emit(success, msg or 'RAW conversion complete.')
+
+    def _convert_group(self, idx: int, group: 'RawGroup') -> list:
+        seq_dir = self._work_dir / f'rawgrp_{idx:04d}'
+        seq_dir.mkdir(parents=True, exist_ok=True)
+
+        # Hard-copy source RAW files into an isolated dir (RAW files often
+        # live on read-only media / camera cards, and CONVERT works against
+        # the Siril CWD).
+        name_counters: dict = {}
+        for src in group.files:
+            name = src.name
+            orig = name
+            if name in name_counters:
+                n = name_counters[name]
+                stem, suf = os.path.splitext(name)
+                name = f'{stem}_{n:03d}{suf}'
+                name_counters[orig] += 1
+            else:
+                name_counters[name] = 1
+            dst = seq_dir / name
+            if not dst.exists():
+                shutil.copy2(str(src), str(dst))
+
+        self._cd(seq_dir)
+        seq_name = f'rawconv_{idx:04d}_'
+        # No -debayer: see class docstring. CFA-ness is recorded via the
+        # synthesized BAYERPAT header instead, exactly like native OSC FITS.
+        self.siril.cmd('convert', seq_name)
+
+        produced = sorted(
+            f for f in seq_dir.iterdir()
+            if is_fits_file(f) and f.name.startswith(seq_name))
+
+        if not produced:
+            self._log(f'    ⚠ No FITS output found for group {group.label()}',
+                      LogColor.SALMON)
+            return []
+
+        # ── Synthesize FITS headers from the confirmed group metadata ──────
+        date_obs = None
+        if group.date_str:
+            date_obs = f'{group.date_str}T12:00:00'   # noon placeholder time
+
+        imgtype_hdr = group.imgtype.upper()
+        out_dir = self.out_root / group.folder_name()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_files: list = []
+        for f in produced:
+            dst = out_dir / f.name
+            shutil.move(str(f), str(dst))
+            try:
+                with astrofits.open(dst, mode='update',
+                                    ignore_missing_simple=True) as hdul:
+                    h = hdul[0].header
+                    h['IMAGETYP'] = imgtype_hdr
+                    if group.exptime is not None:
+                        h['EXPTIME']  = float(group.exptime)
+                        h['EXPOSURE'] = float(group.exptime)
+                    if group.filter:
+                        h['FILTER'] = group.filter
+                    if group.target:
+                        h['OBJECT'] = group.target
+                    if date_obs:
+                        h['DATE-OBS'] = date_obs
+                    # Mark every DSLR conversion as CFA so the existing
+                    # OSC/CFA debayer-at-calibrate logic picks it up.
+                    h['BAYERPAT'] = self.bayer_pattern
+                    hdul.flush()
+            except Exception as exc:
+                self._log(f'    ⚠ Header synthesis failed for {dst.name}: {exc}',
+                          LogColor.SALMON)
+                continue
+            out_files.append(dst)
+
+        self._log(
+            f'  [{idx+1}] {group.label()}  →  {len(out_files)} FITS file(s) '
+            f'in {out_dir.name}/', LogColor.GREEN)
+        return out_files
+
+
+def _bayer_pattern_dialog(parent) -> 'Optional[str]':
+    """
+    Ask the user for their camera's Bayer pattern (most DSLR/mirrorless
+    cameras use RGGB, but some sensors differ).  Returns the chosen pattern
+    string, or None if cancelled.
+    """
+    from PyQt6.QtWidgets import QInputDialog
+    patterns = ['RGGB', 'BGGR', 'GRBG', 'GBRG']
+    pattern, ok = QInputDialog.getItem(
+        parent, 'Camera Sensor Pattern',
+        'Select your camera\'s Bayer (CFA) pattern.\n'
+        'RGGB is correct for the great majority of DSLR/mirrorless cameras.',
+        patterns, 0, False)
+    return pattern if ok else None
+
+
+# =============================================================================
+# DSLR calibration stacking wizard (lightweight — no camera/temp matching)
+# =============================================================================
+
+class DslrCalStackingWizard(QDialog):
+    """
+    Simplified stacking step for converted DSLR RAW calibration frames.
+
+    Unlike LibraryStackingWizard / LocalStackingWizard, DSLR conversions
+    carry no INSTRUME or SET-TEMP metadata (DSLRs don't report
+    sensor temperature), so camera/temperature matching is meaningless here.
+    Grouping was already fully decided by the user in RawImportWizard, so
+    this wizard simply stacks each confirmed bias/dark/flat group in turn,
+    matching dark-flats to flats purely by exposure-time string (rounding
+    down within a small tolerance, same rule as the rest of the pipeline)
+    and bias to darks/flats by simple availability — no camera identity
+    check since there is only ever one DSLR body per import batch in
+    practice, and the groups themselves were user-confirmed.
+
+    After exec():
+      .output_paths   dict  group.key() -> Path   (produced master, success only)
+    """
+
+    _STYLE = LibraryStackingWizard._STYLE
+
+    def __init__(self, parent, bias_groups: list, dark_groups: list,
+                 flat_groups: list, siril: 's.SirilInterface',
+                 masters_dir: Path, dark_flat_tolerance: float = 0.5,
+                 temp_base_dir: 'Optional[Path]' = None):
+        super().__init__(parent)
+        self.setWindowTitle('Stack DSLR Calibration Masters')
+        self.setMinimumSize(880, 560)
+        self.setModal(True)
+        self.setStyleSheet(self._STYLE)
+
+        self._siril               = siril
+        self._masters_dir         = masters_dir
+        self._dark_flat_tolerance = dark_flat_tolerance
+        self._temp_base_dir       = temp_base_dir
+
+        self._bias_groups = bias_groups
+        self._dark_groups = dark_groups
+        self._flat_groups = flat_groups
+
+        self.output_paths: dict = {}
+        self._worker: 'Optional[_DslrCalStackWorker]' = None
+        self._current_idx = -1
+        self._all_groups = list(bias_groups) + list(dark_groups) + list(flat_groups)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 12)
+
+        hdr = QLabel('🔬  Stack DSLR Calibration Masters')
+        hdr.setStyleSheet('color:#ccddff; font-size:12pt; font-weight:bold;')
+        lay.addWidget(hdr)
+
+        desc = QLabel(
+            'Each confirmed bias / dark / flat group will be stacked into a '
+            'single master.  Flats are calibrated with the closest matching '
+            'dark (by exposure time) when available, falling back to a bias.')
+        desc.setWordWrap(True)
+        desc.setStyleSheet('color:#8888bb; font-size:9pt;')
+        lay.addWidget(desc)
+
+        tbl = QTableWidget()
+        tbl.setColumnCount(5)
+        tbl.setHorizontalHeaderLabels(['Type', 'Group', 'Frames', 'Calibration', 'Status'])
+        tbl.setRowCount(len(self._all_groups))
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setAlternatingRowColors(True)
+        hdr_v = tbl.horizontalHeader()
+        hdr_v.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr_v.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr_v.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr_v.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr_v.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+
+        self._status_items: list = []
+        for row, group in enumerate(self._all_groups):
+            tbl.setItem(row, 0, _tbl_item(group.imgtype.upper(), center=True))
+            tbl.setItem(row, 1, _tbl_item(group.label()))
+            tbl.setItem(row, 2, _tbl_item(str(len(group.files)), center=True))
+            cal_desc = self._describe_calibration(group)
+            tbl.setItem(row, 3, _tbl_item(cal_desc))
+            st_item = _tbl_item('⏳ Pending', center=True, color='#888888')
+            tbl.setItem(row, 4, st_item)
+            self._status_items.append(st_item)
+        self._tbl = tbl
+        lay.addWidget(tbl, stretch=1)
+
+        self._bar = QProgressBar()
+        self._bar.setMaximum(max(len(self._all_groups), 1))
+        self._bar.setValue(0)
+        self._bar.setFixedHeight(18)
+        lay.addWidget(self._bar)
+        self._bar_lbl = QLabel('')
+        self._bar_lbl.setStyleSheet('color:#666688; font-size:8pt; font-family:monospace;')
+        lay.addWidget(self._bar_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._btn_stack = QPushButton(f'\u25b6  Stack {len(self._all_groups)} group(s)')
+        self._btn_stack.setObjectName('btn_stack')
+        self._btn_stack.setFixedHeight(34)
+        self._btn_stack.clicked.connect(self._on_stack_all)
+        btn_row.addWidget(self._btn_stack)
+        self._btn_done = QPushButton('✔  Done')
+        self._btn_done.setObjectName('btn_done')
+        self._btn_done.setFixedHeight(34)
+        self._btn_done.setEnabled(False)
+        self._btn_done.clicked.connect(self.accept)
+        btn_row.addWidget(self._btn_done)
+        lay.addLayout(btn_row)
+
+    def _exptime_str(self, et) -> str:
+        if et is None:
+            return '?s'
+        return f'{int(et)}s' if et == int(et) else f'{et}s'
+
+    def _find_dark_flat_match(self, flat_group: 'RawGroup') -> 'Optional[RawGroup]':
+        if flat_group.exptime is None:
+            return None
+        best, best_delta = None, float('inf')
+        for d in self._dark_groups:
+            if d.exptime is None or d.exptime > flat_group.exptime:
+                continue
+            delta = flat_group.exptime - d.exptime
+            if delta <= self._dark_flat_tolerance and delta < best_delta:
+                best, best_delta = d, delta
+        return best
+
+    def _describe_calibration(self, group: 'RawGroup') -> str:
+        if group.imgtype == 'bias':
+            return '(none – stacked directly)'
+        if group.imgtype == 'dark':
+            if self._bias_groups:
+                return f'bias: {self._bias_groups[0].label()}'
+            return '(no bias available – stacked without calibration)'
+        if group.imgtype == 'flat':
+            df = self._find_dark_flat_match(group)
+            if df is not None:
+                return f'dark flat: {df.label()}'
+            if self._bias_groups:
+                return f'bias: {self._bias_groups[0].label()}'
+            return '(no calibration available)'
+        return ''
+
+    def _on_stack_all(self):
+        self._btn_stack.setEnabled(False)
+        self._worker = _DslrCalStackWorker(
+            self._siril, self._all_groups, self._bias_groups, self._dark_groups,
+            self._masters_dir, dark_flat_tolerance=self._dark_flat_tolerance,
+            temp_base_dir=self._temp_base_dir,
+        )
+        self._worker.group_progress.connect(self._on_group_progress)
+        self._worker.group_done.connect(self._on_group_done)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_group_progress(self, idx: int, total: int, label: str):
+        self._bar.setMaximum(total)
+        self._bar.setValue(idx)
+        self._bar_lbl.setText(f'Stacking: {label}')
+        if 0 <= idx < len(self._status_items):
+            self._status_items[idx].setText('⏱ Stacking…')
+            self._status_items[idx].setForeground(QColor('#ffb347'))
+
+    def _on_group_done(self, idx: int, ok: bool, path_str: str):
+        if not (0 <= idx < len(self._status_items)):
+            return
+        if ok:
+            self._status_items[idx].setText('✓ Done')
+            self._status_items[idx].setForeground(QColor('#55cc88'))
+            group = self._all_groups[idx]
+            self.output_paths[group.key()] = Path(path_str)
+        else:
+            self._status_items[idx].setText('⚠ Failed')
+            self._status_items[idx].setForeground(QColor('#ff7070'))
+
+    def _on_finished(self, success: bool, message: str):
+        self._bar_lbl.setText('Complete.' if success else f'Error: {message}')
+        self._btn_done.setEnabled(True)
+        self._btn_stack.setEnabled(False)
+
+    def closeEvent(self, event):
+        if self._worker is not None and self._worker.isRunning():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, 'Stacking in progress',
+                'Stacking is still running. Please wait for it to finish.')
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def reject(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        super().reject()
+
+
+class _DslrCalStackWorker(QThread):
+    """Background worker for DslrCalStackingWizard — stacks each group in turn."""
+    group_progress = pyqtSignal(int, int, str)
+    group_done     = pyqtSignal(int, bool, str)
+    finished       = pyqtSignal(bool, str)
+
+    def __init__(self, siril, all_groups: list, bias_groups: list, dark_groups: list,
+                 masters_dir: Path, dark_flat_tolerance: float = 0.5,
+                 temp_base_dir: 'Optional[Path]' = None):
+        super().__init__()
+        self.siril               = siril
+        self.all_groups          = all_groups
+        self.bias_groups         = bias_groups
+        self.dark_groups         = dark_groups
+        self.masters_dir         = masters_dir
+        self.dark_flat_tolerance = dark_flat_tolerance
+        self._work_dir           = _make_temp_dir('siril_dslrcal_', temp_base_dir)
+        self._stacked_paths: dict = {}   # group.key() -> Path
+
+    def _log(self, msg, color=LogColor.BLUE):
+        try:
+            self.siril.log(msg, color)
+        except Exception:
+            pass
+
+    def _cd(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        p = str(path.resolve())
+        self.siril.cmd(f'cd "{p}"' if ' ' in p else f'cd {p}')
+
+    @staticmethod
+    def _rejection_params(n: int) -> tuple:
+        if n <= 4:   return 'p', '0.2', '0.1'
+        if n <= 10:  return 's', '3', '3'
+        if n <= 30:  return 'w', '3', '3'
+        if n <= 300: return 'g', '0.300', '0.050'
+        return 'l', '5', '4'
+
+    def _find_dark_flat_match(self, flat_group) -> 'Optional[object]':
+        if flat_group.exptime is None:
+            return None
+        best, best_delta = None, float('inf')
+        for d in self.dark_groups:
+            if d.exptime is None or d.exptime > flat_group.exptime:
+                continue
+            delta = flat_group.exptime - d.exptime
+            if delta <= self.dark_flat_tolerance and delta < best_delta:
+                best, best_delta = d, delta
+        return best
+
+    def run(self):
+        self.masters_dir.mkdir(parents=True, exist_ok=True)
+        total   = len(self.all_groups)
+        success = True
+        msg     = ''
+        original_wd: 'Optional[Path]' = None
+        try:
+            original_wd = Path(self.siril.get_siril_wd())
+        except Exception:
+            pass
+
+        try:
+            self.siril.cmd('set32bits')
+            self.siril.cmd('setcompress', '0')
+            self.siril.cmd('setext', 'fit')
+
+            # Order: bias first (so darks/flats can reference it), then darks,
+            # then flats (so flats can reference darks).
+            order = list(self.bias_groups) + list(self.dark_groups) + [
+                g for g in self.all_groups
+                if g not in self.bias_groups and g not in self.dark_groups]
+
+            for group in order:
+                idx = self.all_groups.index(group)
+                self.group_progress.emit(idx, total, group.label())
+                try:
+                    out_path = self._stack_group(idx, group)
+                    if out_path is not None:
+                        self._stacked_paths[group.key()] = out_path
+                        self.group_done.emit(idx, True, str(out_path))
+                    else:
+                        self.group_done.emit(idx, False, 'no output produced')
+                except Exception as exc:
+                    self._log(f'  ⚠ Failed to stack {group.label()}: {exc}',
+                              LogColor.SALMON)
+                    self.group_done.emit(idx, False, str(exc))
+
+            self._log('DSLR calibration stacking complete.', LogColor.GREEN)
+        except Exception as exc:
+            success = False
+            msg = f'DSLR stacking error: {exc}'
+            try:
+                self.siril.log(msg, LogColor.RED)
+            except Exception:
+                pass
+        finally:
+            if original_wd is not None and original_wd.exists():
+                try:
+                    _rp = str(original_wd.resolve())
+                    self.siril.cmd(f'cd "{_rp}"' if ' ' in _rp else f'cd {_rp}')
+                except Exception:
+                    pass
+            try:
+                shutil.rmtree(str(self._work_dir), ignore_errors=True)
+            except Exception:
+                pass
+        self.finished.emit(success, msg or 'DSLR calibration stacking complete.')
+
+    def _stack_group(self, idx: int, group) -> 'Optional[Path]':
+        files = group.files
+        n     = len(files)
+        if n < 2:
+            self._log(
+                f'  ⚠ {group.label()}: only {n} frame(s) – need ≥2 to stack, skipped.',
+                LogColor.SALMON)
+            return None
+
+        seq_dir = self._work_dir / f'dslrcal_{idx:04d}'
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            dst = seq_dir / f.name
+            if not dst.exists():
+                shutil.copy2(str(f), str(dst))
+
+        self._cd(seq_dir)
+        seq_name = f'dslrcal_{idx:04d}_'
+        self.siril.cmd('convert', seq_name)
+
+        cal_seq = seq_name
+        if group.imgtype == 'dark' and self.bias_groups:
+            bias_path = self._stacked_paths.get(self.bias_groups[0].key())
+            if bias_path and bias_path.exists():
+                self.siril.cmd('calibrate', seq_name, _qflag('-bias', bias_path))
+                cal_seq = f'pp_{seq_name}'
+        elif group.imgtype == 'flat':
+            df = self._find_dark_flat_match(group)
+            cal_path = self._stacked_paths.get(df.key()) if df is not None else None
+            if cal_path is None and self.bias_groups:
+                cal_path = self._stacked_paths.get(self.bias_groups[0].key())
+            if cal_path and cal_path.exists():
+                self.siril.cmd('calibrate', seq_name, _qflag('-bias', cal_path))
+                cal_seq = f'pp_{seq_name}'
+
+        norm = '-nonorm' if group.imgtype in ('dark', 'bias') else '-norm=mul'
+        algo, sig_lo, sig_hi = self._rejection_params(n)
+        out_name = f'master-{group.imgtype}_dslr_{group.folder_name()}'
+        out_path = (self.masters_dir / out_name).with_suffix('')
+        self.siril.cmd(
+            'stack', cal_seq,
+            'rej', algo, sig_lo, sig_hi,
+            norm,
+            _qflag('-out', out_path),
+        )
+
+        for ext in FITS_EXTS:
+            cand = self.masters_dir / (out_path.name + ext)
+            if cand.exists():
+                shutil.rmtree(str(seq_dir), ignore_errors=True)
+                return cand
+        # Fallback: search seq_dir
+        for ext in FITS_EXTS:
+            cand = seq_dir / (out_path.name + ext)
+            if cand.exists():
+                dest = self.masters_dir / cand.name
+                shutil.move(str(cand), str(dest))
+                shutil.rmtree(str(seq_dir), ignore_errors=True)
+                return dest
+        shutil.rmtree(str(seq_dir), ignore_errors=True)
+        return None
 
 
 class FITSOrganizerWindow(QMainWindow):
@@ -9683,7 +11083,7 @@ class FITSOrganizerWindow(QMainWindow):
         exptime  = float(max(set(exptimes), key=exptimes.count)) if exptimes else None
         set_temps = [fi['set_temp'] for fi in group_files if fi.get('set_temp') is not None]
         set_temp = float(max(set(set_temps), key=set_temps.count)) if set_temps else None
-        cam_ids  = [fi.get('cameraid') or fi.get('instrume', '') for fi in group_files]
+        cam_ids  = [fi.get('instrume', '') for fi in group_files]
         cam_id   = max(set(cam_ids), key=cam_ids.count) if cam_ids else ''
 
         EXP_TOL, TEMP_TOL = 0.20, 1.0
@@ -9700,7 +11100,7 @@ class FITSOrganizerWindow(QMainWindow):
                         # session mode: just return the first external dark
                         best_name = f.name; break
                     # library mode scoring
-                    cid_d = str(h.get('CAMERAID', h.get('INSTRUME', ''))).strip()
+                    cid_d = str(h.get('INSTRUME', '')).strip()
                     if cam_id and cid_d and cid_d != cam_id:
                         continue
                     et = h.get('EXPTIME', h.get('EXPOSURE', None))
@@ -9832,6 +11232,181 @@ class FITSOrganizerWindow(QMainWindow):
 
     def _on_dropped(self, raw_paths: list[str]):
         fits_files = collect_fits(raw_paths)
+        dslr_files = collect_raw(raw_paths)
+
+        if not fits_files and not dslr_files:
+            self.status_label.setText('No FITS or RAW files found in the selection.')
+            self.siril.log('Drop ignored: no FITS or RAW files found.', LogColor.SALMON)
+            return
+
+        if fits_files and dslr_files:
+            from PyQt6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setWindowTitle('FITS and RAW files found')
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(
+                f'The dropped selection contains both {len(fits_files)} FITS file(s) '
+                f'and {len(dslr_files)} RAW camera file(s) (NEF/CR2/CR3/ARW/…).\n\n'
+                'Which would you like to process? The other type will be ignored '
+                'for this drop.')
+            btn_fits = box.addButton('Process FITS', QMessageBox.ButtonRole.AcceptRole)
+            btn_raw  = box.addButton('Process RAW',  QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_fits:
+                dslr_files = []
+            elif clicked is btn_raw:
+                fits_files = []
+            else:
+                self.siril.log('Drop cancelled by user.', LogColor.BLUE)
+                return
+
+        if dslr_files and not fits_files:
+            self._handle_raw_drop(dslr_files, raw_paths)
+            return
+
+        self._handle_fits_drop(fits_files)
+
+    def _handle_raw_drop(self, dslr_files: list, original_paths: list[str]):
+        """
+        Run the full RAW import pipeline:
+          1. RawImportWizard – confirm/fix grouping (drag-and-drop, new groups).
+          2. Ask the camera's Bayer pattern.
+          3. RawConversionWorker – CONVERT each group, synthesize FITS headers.
+          4. For calibration groups (dark/flat/bias): DslrCalStackingWizard
+             stacks them into masters.
+          5. Converted light subs + new masters are merged into _all_infos via
+             the normal ScanThread path, so the rest of the pipeline (tree,
+             calibration matcher, engine) treats them exactly like native FITS.
+        """
+        raw_roots = [Path(p) for p in original_paths if Path(p).is_dir()]
+        if not raw_roots:
+            # Individual files were dropped rather than a folder — use each
+            # file's parent as its own root so relative-path parsing still works.
+            raw_roots = sorted({f.parent for f in dslr_files})
+
+        wiz = RawImportWizard(self, dslr_files, raw_roots)
+        if wiz.exec() != QDialog.DialogCode.Accepted or not wiz.groups:
+            self.siril.log('RAW import cancelled.', LogColor.BLUE)
+            return
+
+        bayer = _bayer_pattern_dialog(self)
+        if bayer is None:
+            self.siril.log('RAW import cancelled (no Bayer pattern selected).',
+                           LogColor.BLUE)
+            return
+
+        n_files = sum(len(g.files) for g in wiz.groups)
+        self.siril.log(
+            f'RAW import: converting {n_files} file(s) across '
+            f'{len(wiz.groups)} group(s)…', LogColor.BLUE)
+        self.status_label.setText(f'Converting {n_files} RAW file(s)…')
+        self.progress_bar.setMaximum(len(wiz.groups))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat('Converting group %v / %m')
+        self.progress_bar.setVisible(True)
+        self.drop_zone.setEnabled(False)
+        self.go_btn.setEnabled(False)
+
+        conv_root = _make_temp_dir('siril_amsp_rawconv_out_', self._temp_base_dir)
+        self._local_cal_proc_roots.append(conv_root)   # cleaned up after processing
+
+        conv_worker = RawConversionWorker(
+            self.siril, wiz.groups, conv_root,
+            bayer_pattern=bayer, temp_base_dir=self._temp_base_dir)
+
+        from PyQt6.QtWidgets import QApplication as _QAppRaw
+
+        def _on_conv_progress(done, total, label):
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(done)
+            self.progress_bar.setFormat(f'Converting: {label}  (%v/%m)')
+            _QAppRaw.processEvents()
+
+        def _on_conv_finished(success, message):
+            self.progress_bar.setVisible(False)
+            if not success:
+                self.siril.log(f'RAW conversion failed: {message}', LogColor.RED)
+                self.drop_zone.setEnabled(True)
+                return
+            self._on_raw_conversion_done(wiz.groups, conv_worker.output_files, conv_root)
+
+        conv_worker.progress.connect(_on_conv_progress)
+        conv_worker.finished.connect(_on_conv_finished)
+        # RawConversionWorker issues Siril commands and must run on a QThread,
+        # but the wizard/dialogs that follow need to happen on the main thread
+        # after it completes — handled via the finished-signal callback above.
+        conv_worker.start()
+        # Block here (processing events) until conversion completes, since the
+        # rest of this drop-handling flow (stacking wizard, FITS scan merge)
+        # is easiest to express linearly rather than as further nested callbacks.
+        while conv_worker.isRunning():
+            _QAppRaw.processEvents()
+            conv_worker.wait(50)
+        self._raw_conv_worker_ref = conv_worker   # keep alive until GC-safe point
+
+    def _on_raw_conversion_done(self, groups: list, output_files: dict, conv_root: Path):
+        """
+        Called after RawConversionWorker finishes.  Splits converted output
+        into light subs (go straight to the FITS scan path) versus
+        calibration groups (dark/flat/bias — get stacked via
+        DslrCalStackingWizard first), then merges everything into _all_infos.
+        """
+        light_fits: list = []
+        cal_groups_with_files: list = []   # (RawGroup, list[Path])
+
+        for group in groups:
+            files = output_files.get(group.key(), [])
+            if not files:
+                continue
+            if group.imgtype == 'light':
+                light_fits.extend(files)
+            else:
+                cal_groups_with_files.append((group, files))
+
+        # Re-attach converted file lists to their RawGroup objects so the
+        # DSLR stacking wizard can use group.files directly.
+        bias_groups, dark_groups, flat_groups = [], [], []
+        for group, files in cal_groups_with_files:
+            group.files = files
+            if group.imgtype == 'bias':
+                bias_groups.append(group)
+            elif group.imgtype == 'dark':
+                dark_groups.append(group)
+            elif group.imgtype == 'flat':
+                flat_groups.append(group)
+
+        master_fits: list = []
+        if bias_groups or dark_groups or flat_groups:
+            masters_dir = conv_root / 'dslr_masters'
+            stack_wiz = DslrCalStackingWizard(
+                self, bias_groups, dark_groups, flat_groups,
+                self.siril, masters_dir,
+                dark_flat_tolerance=self._dark_flat_tolerance,
+                temp_base_dir=self._temp_base_dir,
+            )
+            stack_wiz.exec()
+            master_fits = [p for p in stack_wiz.output_paths.values() if p.exists()]
+            if master_fits:
+                self.siril.log(
+                    f'DSLR calibration stacking: {len(master_fits)} master(s) built.',
+                    LogColor.GREEN)
+
+        all_new_fits = light_fits + master_fits
+        if not all_new_fits:
+            self.siril.log('RAW import produced no usable FITS output.',
+                           LogColor.SALMON)
+            self.drop_zone.setEnabled(True)
+            self.go_btn.setEnabled(bool(self._all_infos))
+            return
+
+        self.siril.log(
+            f'RAW import: {len(light_fits)} light sub(s), {len(master_fits)} '
+            f'master(s) ready — scanning into the file list…', LogColor.BLUE)
+        self._handle_fits_drop(all_new_fits)
+
+    def _handle_fits_drop(self, fits_files: list):
         if not fits_files:
             self.status_label.setText('No FITS files found in the selection.')
             self.siril.log('Drop ignored: no FITS files found.', LogColor.SALMON)
@@ -9962,11 +11537,11 @@ class FITSOrganizerWindow(QMainWindow):
         # ── Group dark subs: (camera_trim, exp_bucket, temp_bucket) ──────────
         # Use the same ±0.5 s exptime bucketing as the library scanner so
         # groups here align with what _build_dark_stacking_plan would produce.
-        all_cam_raws_d = [fi.get('cameraid') or fi.get('instrume', '') or '?'
+        all_cam_raws_d = [fi.get('instrume') or '?'
                           for fi in dark_subs]
         dark_by_group: dict = {}
         for fi in dark_subs:
-            raw_cam = fi.get('cameraid') or fi.get('instrume', '') or '?'
+            raw_cam = fi.get('instrume') or '?'
             cam     = _trim_camera(raw_cam, all_cam_raws_d)
             et      = fi.get('exptime')
             # Round to nearest 0.1 s (matches _build_dark_stacking_plan)
@@ -9989,11 +11564,11 @@ class FITSOrganizerWindow(QMainWindow):
             dark_groups.append((label, files))
 
         # ── Group flat subs: (camera_trim, filter, scope_key, session) ────────
-        all_cam_raws_f = [fi.get('cameraid') or fi.get('instrume', '') or '?'
+        all_cam_raws_f = [fi.get('instrume') or '?'
                           for fi in flat_subs]
         flat_by_group: dict = {}
         for fi in flat_subs:
-            raw_cam   = fi.get('cameraid') or fi.get('instrume', '') or '?'
+            raw_cam   = fi.get('instrume') or '?'
             cam       = _trim_camera(raw_cam, all_cam_raws_f)
             filt      = fi.get('filter') or NO_FILTER
             filt_s    = _safe_name(filt)
@@ -10479,7 +12054,7 @@ class FITSOrganizerWindow(QMainWindow):
             exp_k  = _exptime_key(fi.get('exptime'))
             temp_v = fi.get('set_temp')
             temp_k = (f"{temp_v:.1f}\u00b0C" if temp_v is not None else '\u2014')
-            cam_id = fi.get('cameraid') or fi.get('instrume', '')
+            cam_id = fi.get('instrume', '')
             filt_s = _safe_name(fi['filter'])
             dkey   = (fi['session'], filt_s, exp_k, temp_k)
             if dkey not in seen_dark:
@@ -11157,7 +12732,7 @@ class FITSOrganizerWindow(QMainWindow):
             for sess in sessions.values():
                 for files in sess.values():
                     for fi in files:
-                        cid = fi.get('cameraid') or fi.get('instrume', '')
+                        cid = fi.get('instrume', '')
                         if cid:
                             cam_id = cid
                             break
