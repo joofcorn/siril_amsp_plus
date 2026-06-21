@@ -1,4 +1,8 @@
 """
+AMSP Plus
+Additional features added by Nicholas Brandner
+
+Original base AMSP header:
 Siril Wizard – Automatic Multi-Session Processing
 © 2026 Cyril Richard – GPL-3.0-or-later
 
